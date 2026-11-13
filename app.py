@@ -193,6 +193,32 @@ def bounded_number(value: Any, low: float, high: float, name: str) -> float:
     return number
 
 
+CONNECT_TIMEOUT = 8   # seconds to (re)connect before a request gives up
+ACTION_TIMEOUT = 10   # seconds a single TV command may take
+_BACKGROUND_TASKS: set[asyncio.Task] = set()  # strong refs so cleanup tasks aren't GC'd
+
+
+def describe(exc: BaseException) -> str:
+    """Human-readable error text; never empty (str(TimeoutError()) is '')."""
+    if isinstance(exc, KeyError) and exc.args:
+        return f"missing field: {exc.args[0]}"
+    return str(exc) or type(exc).__name__
+
+
+async def _dispose(client: WebOsClient) -> None:
+    try:
+        await client.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def dispose_later(client: WebOsClient) -> None:
+    """Close a client without awaiting (safe to call while being cancelled)."""
+    task = asyncio.ensure_future(_dispose(client))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 class TvConnection:
     """Keeps one TV client connected, reconnecting lazily on demand."""
 
@@ -213,24 +239,51 @@ class TvConnection:
             )
             try:
                 await client.connect()
-            except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc}"
+                save_key(self.tv_id, client.client_key)
+            except BaseException as exc:
+                # Covers failures AND cancellation (wait_for timeouts): never leave a
+                # half-open client behind, or each poll would leak a connection.
+                dispose_later(client)
+                self.last_error = (
+                    "connection timed out"
+                    if isinstance(exc, (asyncio.CancelledError, TimeoutError))
+                    else f"{type(exc).__name__}: {describe(exc)}"
+                )
                 raise
-            save_key(self.tv_id, client.client_key)
             self.client, self.last_error = client, None
             return client
 
-    async def _safe_disconnect(self) -> None:
+    async def connect(self) -> WebOsClient:
+        timeout = asyncio.timeout(CONNECT_TIMEOUT)
         try:
-            await self.client.disconnect()  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001
-            pass
-        self.client = None
+            async with timeout:
+                return await self.ensure()
+        except TimeoutError:
+            if not timeout.expired():  # a TimeoutError from inside the library
+                raise
+            raise TimeoutError(
+                f"could not connect to {self.name} within {CONNECT_TIMEOUT}s"
+            ) from None
+
+    async def drop(self, client: WebOsClient) -> None:
+        """Forget `client` so the next request reconnects.
+
+        Only drops it if it is still the current client: a late timeout from an
+        older request must not close a fresh connection opened in the meantime.
+        """
+        async with self.lock:
+            if self.client is client:
+                await self._safe_disconnect()
+
+    async def _safe_disconnect(self) -> None:
+        client, self.client = self.client, None
+        if client:
+            await _dispose(client)
 
     async def status(self) -> dict[str, Any]:
         base = {"id": self.tv_id, "name": self.name, "host": self.host}
         try:
-            client = await asyncio.wait_for(self.ensure(), timeout=8)
+            client = await self.connect()
         except Exception:  # noqa: BLE001
             return {**base, "online": False, "error": self.last_error or "unreachable"}
         state = client.tv_state
@@ -280,7 +333,18 @@ class TvConnection:
         if act == "wait_online":
             await self.wait_online(bounded_number(payload.get("timeout", 45), 1, 120, "timeout"))
             return "online"
-        client = await asyncio.wait_for(self.ensure(), timeout=8)
+        client = await self.connect()
+        try:
+            return await asyncio.wait_for(self._command(client, act, payload), ACTION_TIMEOUT)
+        except TimeoutError:
+            # A TV that lost power can look connected until the socket times out:
+            # drop it so the next request reconnects instead of hanging again.
+            await self.drop(client)
+            raise TimeoutError(
+                f"{self.name} did not respond within {ACTION_TIMEOUT}s"
+            ) from None
+
+    async def _command(self, client: WebOsClient, act: Any, payload: dict[str, Any]) -> Any:
         simple = {
             "play": client.play,
             "pause": client.pause,
@@ -463,13 +527,13 @@ async def api_run_scene(request: web.Request) -> web.Response:
             await conn.action(payload)
             steps_log.append(f"{step['do']} {conn.tv_id}: ok")
         except Exception as exc:  # noqa: BLE001
-            log.warning("scene %s step %d failed: %s", scene["id"], i, exc)
+            log.warning("scene %s step %d failed: %s", scene["id"], i, describe(exc))
             # power_off on a TV that is already off is not a failure worth stopping for
             if step["do"] == "power_off":
-                steps_log.append(f"power_off {conn.tv_id}: skipped ({exc})")
+                steps_log.append(f"power_off {conn.tv_id}: skipped ({describe(exc)})")
                 continue
             return web.json_response(
-                {"ok": False, "error": f"step {i} ({step['do']}): {exc}", "log": steps_log},
+                {"ok": False, "error": f"step {i} ({step['do']}): {describe(exc)}", "log": steps_log},
                 status=400,
             )
     return web.json_response({"ok": True, "log": steps_log})
@@ -491,8 +555,8 @@ async def api_action(request: web.Request) -> web.Response:
         result = await conn.action(payload)
         return web.json_response({"ok": True, "result": result}, dumps=_dumps)
     except Exception as exc:  # noqa: BLE001
-        log.warning("action failed on %s: %s", conn.tv_id, exc)
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        log.warning("action failed on %s: %s", conn.tv_id, describe(exc))
+        return web.json_response({"ok": False, "error": describe(exc)}, status=400)
 
 
 def _dumps(obj: Any) -> str:
@@ -855,7 +919,7 @@ async def pair(tv_id: str) -> None:
     try:
         client = await conn.ensure()
     except Exception as exc:  # noqa: BLE001
-        sys.exit(f"Pairing failed: {exc}")
+        sys.exit(f"Pairing failed: {describe(exc)}")
     print(f"Paired. Key saved to {KEYS_FILE.name}.")
     try:
         info = await client.get_connection_info()

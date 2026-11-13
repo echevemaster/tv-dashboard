@@ -1,0 +1,32 @@
+[
+  {
+    "id": "movie-night",
+    "name": "Movie night",
+    "icon": "🎬",
+    "steps": [
+      {"do": "power_on", "tv": "living"},
+      {"do": "wait_online", "tv": "living", "timeout": 45},
+      {"do": "launch", "tv": "living", "app_id": "netflix"},
+      {"do": "set_volume", "tv": "living", "value": 12}
+    ]
+  },
+  {
+    "id": "console",
+    "name": "Console",
+    "icon": "🎮",
+    "steps": [
+      {"do": "power_on", "tv": "living"},
+      {"do": "wait_online", "tv": "living", "timeout": 45},
+      {"do": "input", "tv": "living", "input_id": "HDMI_1"}
+    ]
+  },
+  {
+    "id": "all-off",
+    "name": "All off",
+    "icon": "🌙",
+    "steps": [
+      {"do": "power_off", "tv": "living"},
+      {"do": "power_off", "tv": "bedroom"}
+    ]
+  }
+]

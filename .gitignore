@@ -1,0 +1,14 @@
+# Private, machine-specific files
+keys.json
+config.json
+tvs.json
+scenes.json
+.*.tmp
+
+# Local environment
+.venv/
+.env
+.DS_Store
+.claude/settings.local.json
+
+__pycache__/
